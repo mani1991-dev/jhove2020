@@ -5,6 +5,9 @@
 /* eslint-disable no-unused-vars */
 /* eslint-disable operator-assignment */
 /* eslint-disable prefer-template */
+/* eslint-disable no-use-before-define */
+/* eslint-disable no-unused-expressions */
+/* eslint-disable quotes */
 import { app, BrowserWindow, ipcMain, screen } from 'electron';
 import * as path from 'path';
 import { format as formatUrl } from 'url';
@@ -12,9 +15,10 @@ import fs from 'fs';
 import os from 'os';
 import mime from 'mime-types';
 import { spawn } from 'child_process';
-import setConfig from '../utils/setConfig';
+import { setConfig, updateConfig, updateDefaultValues } from '../utils/setConfig';
 import setTranslate from '../utils/setTranslate';
 import setPAR from '../utils/setPAR';
+import JobFailed from '../components/Report/JobFailed';
 
 require('events').EventEmitter.defaultMaxListeners = Infinity;
 
@@ -26,6 +30,7 @@ const isDevelopment = process.env.NODE_ENV !== 'production';
 
 let mainWindow;
 let pythonPath;
+let outputPath;
 
 async function createMainWindow() {
   const factor = screen.getPrimaryDisplay().scaleFactor;
@@ -62,6 +67,7 @@ async function createMainWindow() {
   if (isDevelopment) {
     window.webContents.openDevTools();
   }
+  /* window.webContents.openDevTools(); */
 
   if (isDevelopment) {
     window.loadURL(`http://localhost:${process.env.ELECTRON_WEBPACK_WDS_PORT}`);
@@ -87,9 +93,9 @@ async function createMainWindow() {
   });
 
   const translate = await setTranslate(isDevelopment);
-  const config = await setConfig(isDevelopment);
+  const config = await setConfig(isDevelopment, runJobFailed);
   pythonPath = config.pythonPath;
-  const PAR = await setPAR(isDevelopment);
+  const PAR = await setPAR(isDevelopment, runJobFailed);
   window.webContents.on('did-finish-load', () => {
     window.webContents.send('translate', translate);
     window.webContents.send('config', config);
@@ -98,6 +104,10 @@ async function createMainWindow() {
 
   return window;
 }
+
+/* app.on('before-quit', () => {
+  updateConfig(isDevelopment, outputPath);
+}); */
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
@@ -112,6 +122,15 @@ app.on('activate', () => {
 });
 
 const download = (url, dest) => new Promise((resolve, reject) => {
+  const downloadDir = path.join(path.join(os.tmpdir(), 'jhove2020', 'downloads'));
+  try {
+    if (!fs.existsSync(downloadDir)) {
+      fs.mkdirSync(downloadDir);
+    }
+  } catch (err) {
+    reject(err.message);
+  }
+
   const file = fs.createWriteStream(dest);
 
   const sendReq = request.get(url);
@@ -138,6 +157,7 @@ const download = (url, dest) => new Promise((resolve, reject) => {
 
   file.on('error', err => {
     file.close();
+    console.log(err);
 
     if (err.code === 'EEXIST') {
       reject('File already exists');
@@ -157,6 +177,45 @@ app.on('ready', () => {
   mainWindow = createMainWindow();
 });
 
+const runJobFailed = (error) => {
+  const win = new BrowserWindow({
+    minWidth: 1037,
+    minHeight: 500,
+    title: 'JHove 2020',
+    frame: false,
+    titleBarStyle: 'hidden',
+    webPreferences: {
+      nodeIntegration: true,
+      enableRemoteModule: true,
+    },
+  });
+  win._id = 'jobFailed';
+
+  win.webContents.once('did-finish-load', async () => {
+    const translate = await setTranslate(isDevelopment);
+    const config = await setConfig(isDevelopment);
+    win.webContents.send('translate', translate);
+    win.webContents.send('config', config);
+    win.webContents.send('receive-err', { report: error });
+  });
+
+  if (isDevelopment) {
+    win.webContents.openDevTools();
+  }
+
+  if (isDevelopment) {
+    win.loadURL(`http://localhost:${process.env.ELECTRON_WEBPACK_WDS_PORT}`);
+  } else {
+    win.loadURL(
+      formatUrl({
+        pathname: path.join(__dirname, 'index.html'),
+        protocol: 'file',
+        slashes: true,
+      }),
+    );
+  }
+};
+
 const getDateString = () => {
   const date = new Date();
   const year = date.getFullYear();
@@ -168,50 +227,50 @@ const getDateString = () => {
   return `${year}${month}${day}${hours}${mins}${sec}`;
 };
 
-const runScript = (tool, filePath, optionArr, outFol, event) => {
+const runScript = (tool, filePath, optionArr, outFol, event, config) => {
   let shieldedPath = filePath.split('');
   shieldedPath.unshift('"');
   shieldedPath.push('"');
   shieldedPath = shieldedPath.join('');
-  let reportDate = '';
+  let reportData = '';
   let reportText = '';
+  let errorText = '';
   let dest = '';
-  const scriptPath = isDevelopment
-    ? path.join(__dirname, '..', '..', 'libs', tool.toolLabel)
-    : path.join(__dirname, '..', 'libs', tool.toolLabel);
-  if (tool.toolLabel.split('.')[1] === 'bat') {
-    reportDate = spawn(scriptPath, [
-      ...optionArr,
-      filePath,
-    ]);
-  } else if (tool.toolLabel.split('.')[0] === 'jhove/jhove') {
-    reportDate = spawn(scriptPath, [
-      ...optionArr,
-      filePath,
-    ]);
-  } else if (tool.toolLabel.split('.')[1] === 'py') {
-    const python = (os.platform() === 'linux') ? 'python3' : 'python';
-    reportDate = spawn(python, [
-      scriptPath,
-      /* 'jpylyzer/jpylyzer.py', */
-      ...optionArr,
-      filePath,
-    ], { /* cwd: path.join(__dirname, '..', '..', 'libs', tool.id.name), shell: true */ });
+
+  const configTool = Object.keys(config?.tools).find(e => e === tool.toolName);
+  const OSconfigTool = configTool ? config.tools[configTool].find(e => e.OS === os.platform()) : null;
+  if (!OSconfigTool) {
+    event.sender.send('receive-load', false);
+    runJobFailed(`There is no ${tool.toolName} tool in config`);
+    return;
   }
-  reportDate.stdout.on('data', (data) => {
-    reportText += data.toString();
+
+  const scriptPath = isDevelopment
+    ? path.join(__dirname, '..', '..', 'libs', OSconfigTool.scriptPath)
+    : path.join(__dirname, '..', 'libs', OSconfigTool.scriptPath);
+
+  const command = OSconfigTool.scriptType === 'shell' ? scriptPath : OSconfigTool.scriptType;
+
+  const optionObj = {};
+
+  if (OSconfigTool.workingDirectory) {
+    optionObj.cwd = isDevelopment
+      ? path.join(__dirname, '..', '..', 'libs', OSconfigTool.workingDirectory)
+      : path.join(__dirname, '..', 'libs', OSconfigTool.workingDirectory);
+  }
+
+  reportData = spawn(command, [
+    ...OSconfigTool.scriptArguments,
+    ...optionArr,
+    filePath,
+  ], optionObj);
+
+  reportData.stdout.on('data', (data) => {
+    data ? reportText += data.toString() : null;
     dest = path.join(outFol, `${path.basename(filePath)}-${tool.id.name}_${getDateString()}.txt`);
   });
-  reportDate.stderr.on('data', (data) => {
-    console.error(data.toString());
-    event.sender.send('receive-load', false);
-  });
-  reportDate.stdout.on('end', (data) => {
-    fs.writeFile(dest, reportText, error => {
-      if (error) {
-        event.sender.send('receive-load', false);
-        throw error;
-      }
+  reportData.stdout.on('end', () => {
+    if (reportText) {
       const win = new BrowserWindow({
         minWidth: 1037,
         minHeight: 700,
@@ -228,6 +287,7 @@ const runScript = (tool, filePath, optionArr, outFol, event) => {
       win.webContents.once('did-finish-load', async () => {
         const translate = await setTranslate(isDevelopment);
         win.webContents.send('translate', translate);
+        win.webContents.send('config', config);
         win.webContents.send('receiver', { report: reportText, path: dest });
         event.sender.send('receive-load', false);
       });
@@ -247,28 +307,64 @@ const runScript = (tool, filePath, optionArr, outFol, event) => {
           }),
         );
       }
+    }
+    fs.writeFile(dest, reportText, error => {
+      if (error) {
+        event.sender.send('receive-load', false);
+        error.message !== `ENOENT: no such file or directory, open ''`
+          ? runJobFailed(error.message)
+          : runJobFailed(errorText);
+      }
     });
   });
-  reportDate.stderr.on('data', (data) => {
+  reportData.stderr.on('data', (data) => {
     console.error(data.toString());
+    errorText += data.toString();
+    /* event.sender.send('receive-load', false); */
+  });
+
+  reportData.stderr.on('end', (data) => {
     event.sender.send('receive-load', false);
   });
+
+  reportData.on('error', (err) => {
+    errorText += err.toString();
+  });
+
+  outputPath = outFol;
 };
 
 ipcMain.on('execute-file-action', (event, arg) => {
   if (arg.fileOrigin === 'url') {
-    console.log(os.tmpdir());
-    arg.filePath = path.join(os.tmpdir(), `${getDateString()}-${arg.fileName}`);
+    arg.filePath = path.join(os.tmpdir(), 'jhove2020', 'downloads', `${getDateString()}-${arg.fileName}`);
     try {
       download(arg.path, arg.filePath)
-        .then(() => runScript(arg.tool, arg.filePath, arg.option.value, arg.outputFolder, event))
-        .catch(err => console.log(err));
+        .then(() => runScript(arg.tool, arg.filePath, arg.option.value, arg.outputFolder, event, arg.config))
+        .catch(err => {
+          event.sender.send('receive-load', false);
+          runJobFailed(err);
+          console.log(err);
+        });
     } catch (err) {
-      console.log(err);
       event.sender.send('receive-load', false);
+      runJobFailed(err.message);
+      console.log(err);
     }
   } else {
     arg.filePath = arg.path;
-    runScript(arg.tool, arg.filePath, arg.option.value, arg.outputFolder, event);
+    runScript(arg.tool, arg.filePath, arg.option.value, arg.outputFolder, event, arg.config);
+  }
+  try {
+    updateConfig(outputPath);
+  } catch (err) {
+    runJobFailed(err.message);
+  }
+});
+
+ipcMain.on('update-default-values', (event, defaultValues) => {
+  try {
+    updateDefaultValues(defaultValues);
+  } catch (err) {
+    runJobFailed(err.message);
   }
 });
